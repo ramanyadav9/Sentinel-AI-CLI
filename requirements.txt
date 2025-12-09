@@ -1,0 +1,6 @@
+ollama
+mcp
+python-dotenv
+rich
+prompt_toolkit
+httpx
