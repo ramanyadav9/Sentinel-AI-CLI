@@ -210,13 +210,53 @@ async def main():
     
     # --- MCP CONFIGURATION ---
     mcp_config = [
+        # --- Local Sentinel-AI Server (Default) ---
         MCPServer(
             name="sentinel-ai",
             type="local",
             command=r"E:\CyberSentinal All\Sentinel-AI\mcp-server\venv\Scripts\python.exe",
             args=["-m", "sentinel_mcp.server", "--config", r"E:\CyberSentinal All\Sentinel-AI\mcp-server\config.yaml"]
         ),
-        # Add other servers here...
+
+        # --- EXAMPLES: Uncomment to enable ---
+
+        # 1. Filesystem (Read/Write local files)
+        # MCPServer(
+        #     name="filesystem",
+        #     type="local",
+        #     command="npx",
+        #     args=["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\91916\\Documents"] 
+        # ),
+
+        # 2. GitHub (Search repos, read files, manage issues)
+        # Requires GITHUB_PERSONAL_ACCESS_TOKEN in env
+        # MCPServer(
+        #     name="github",
+        #     type="local",
+        #     command="npx",
+        #     args=["-y", "@modelcontextprotocol/server-github"],
+        #     env={"GITHUB_PERSONAL_ACCESS_TOKEN": os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")}
+        # ),
+
+        # 3. Brave Search (Internet search)
+        # Requires BRAVE_API_KEY in env
+        # MCPServer(
+        #     name="brave-search",
+        #     type="local",
+        #     command="npx",
+        #     args=["-y", "@modelcontextprotocol/server-brave-search"],
+        #     env={"BRAVE_API_KEY": os.getenv("BRAVE_API_KEY")}
+        # ),
+
+        # 4. Google Maps (Location search)
+        # Requires GOOGLE_MAPS_API_KEY in env
+        # MCPServer(
+        #     name="google-maps",
+        #     type="local",
+        #     command="npx",
+        #     args=["-y", "@modelcontextprotocol/server-google-maps"],
+        #     env={"GOOGLE_MAPS_API_KEY": os.getenv("GOOGLE_MAPS_API_KEY")}
+        # ),
     ]
 
     # Connection Phase
