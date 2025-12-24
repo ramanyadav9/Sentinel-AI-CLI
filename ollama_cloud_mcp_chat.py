@@ -2,11 +2,17 @@ import asyncio
 import json
 import os
 import httpx
+import time
+import math
 from typing import Optional, Any, Literal
 from dataclasses import dataclass
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
+try:
+    from mcp.client.streamable_http import streamablehttp_client as http_client
+except ImportError:
+    http_client = None  # Handle older mcp versions gracefully or error later
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -39,6 +45,7 @@ class MCPServer:
     url: Optional[str] = None
     env: Optional[dict] = None
     headers: Optional[dict] = None
+    transport: Literal["sse", "http"] = "sse"
 
 from contextlib import AsyncExitStack
 
@@ -46,19 +53,32 @@ from contextlib import AsyncExitStack
 
 class SentinelAIAgent:
     def __init__(self):
-        # 1. Load Ollama Cloud Configuration
+        # 1. Load Configurations
+        self.primary_host = os.getenv("PRIMARY_OLLAMA_HOST")
+        self.primary_model = os.getenv("PRIMARY_OLLAMA_MODEL")
+        
+        self.fallback_host = os.getenv("FALLBACK_OLLAMA_HOST", "https://ollama.com")
+        self.fallback_model = os.getenv("FALLBACK_OLLAMA_MODEL")
         self.ollama_api_key = os.getenv("OLLAMA_API_KEY")
-        # FORCE use of official cloud endpoint regardless of local env vars (which might be 0.0.0.0)
-        self.ollama_host = "https://ollama.com" 
-        self.model = os.getenv("OLLAMA_CLOUD_MODEL", "gpt-oss:120b-cloud")
 
-        if not self.ollama_api_key:
-            raise ValueError("OLLAMA_API_KEY missing! Check your .env file.")
+        if not self.primary_host or not self.primary_model:
+            console.print("[bold yellow]⚠ PRIMARY_OLLAMA_HOST or MODEL not set in .env![/bold yellow]")
 
-        # 2. Initialize Ollama Client
-        self.client = ollama.Client(
-            host=self.ollama_host,
-            headers={"Authorization": f"Bearer {self.ollama_api_key}"},
+        # 2. Initialize Clients
+        # Primary Client (Usually local/remote server without auth)
+        self.primary_client = ollama.Client(
+            host=self.primary_host,
+            timeout=30.0
+        )
+        
+        # Fallback Client (Usually Ollama Cloud with auth)
+        fallback_headers = {}
+        if self.ollama_api_key:
+            fallback_headers["Authorization"] = f"Bearer {self.ollama_api_key}"
+            
+        self.fallback_client = ollama.Client(
+            host=self.fallback_host,
+            headers=fallback_headers,
             timeout=30.0
         )
 
@@ -67,6 +87,18 @@ class SentinelAIAgent:
         self.mcp_servers: dict[str, ClientSession] = {}
         self.available_tools: list[dict] = []
         self.conversation_history: list[dict] = []
+        self.using_fallback = False
+
+    def safe_json(obj):
+        try:
+            return json.dumps(obj)
+        except TypeError:
+            return json.dumps(str(obj))
+
+    def estimate_tokens(text: str) -> int:
+        """Rough estimate of tokens (1 token ~= 4 chars)"""
+        if not text: return 0
+        return math.ceil(len(text) / 4)
 
     # ------------------------------
     # Connection Methods
@@ -82,11 +114,23 @@ class SentinelAIAgent:
                 )
                 transport = await self.exit_stack.enter_async_context(stdio_client(params))
             elif server.type == "remote":
-                transport = await self.exit_stack.enter_async_context(sse_client(server.url, headers=server.headers or {}))
+                if server.transport == "sse":
+                    transport = await self.exit_stack.enter_async_context(sse_client(server.url, headers=server.headers or {}))
+                elif server.transport == "http":
+                    if http_client is None:
+                         raise ImportError("mcp.client.http module not found. Please upgrade 'mcp' package.")
+                    transport = await self.exit_stack.enter_async_context(http_client(server.url, headers=server.headers or {}))
+                else:
+                    raise ValueError(f"Unknown transport: {server.transport}")
             else:
                 return False
 
-            read, write = transport
+            # Extract read/write streams safely (handle potential 3-item tuples)
+            if isinstance(transport, tuple) and len(transport) >= 2:
+                read, write = transport[0], transport[1]
+            else:
+                read, write = transport
+            
             session = await self.exit_stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
@@ -113,7 +157,6 @@ class SentinelAIAgent:
 
     async def chat(self, user_message: str):
         self.conversation_history.append({"role": "user", "content": user_message})
-        
         # Prepare tools for Ollama
         ollama_tools = [{
             "type": "function",
@@ -124,12 +167,22 @@ class SentinelAIAgent:
             }
         } for t in self.available_tools]
 
-        max_turns = 5
+        max_turns = 10
         for _ in range(max_turns):
+            current_client = self.primary_client
+            current_model = self.primary_model
+            
+            if self.using_fallback:
+                current_client = self.fallback_client
+                current_model = self.fallback_model
+
             try:
                 # API Call
-                response = self.client.chat(
-                    model=self.model,
+                if _ == 0:
+                   console.print(f"[dim]Calling {current_model} with {len(ollama_tools)} tools...[/dim]")
+                
+                response = current_client.chat(
+                    model=current_model,
                     messages=self.conversation_history,
                     tools=ollama_tools if ollama_tools else None,
                     stream=False
@@ -156,23 +209,59 @@ class SentinelAIAgent:
 
                     console.print(f"  [cyan]› {fname}[/cyan]")
                     
-                    # Execute
+                    # Execute with timing and stats
+                    start_time = time.time()
+                    
                     session = self.mcp_servers[tool_def["server"]]
                     result = await session.call_tool(tool_def["original_name"], fargs)
                     
-                    # Feed back to history
+                    duration = time.time() - start_time
+                    
+                    # --- TRUNCATION LOGIC ---
+                    # Logs can be massive. We truncate to keep context manageable while using model capacity.
+                    content_str = str(result.content)
+                    max_chars = 500000 # Roughly 125k tokens (fits within most model windows)
+                    if len(content_str) > max_chars:
+                        console.print(f"  [yellow]⚠ Truncating response from {len(content_str)} to {max_chars} chars[/yellow]")
+                        content_str = content_str[:max_chars] + "\n... [TRUNCATED DUE TO SIZE] ..."
+
+                    # Calculate stats
+                    input_str = json.dumps(fargs)
+                    input_tokens = SentinelAIAgent.estimate_tokens(input_str)
+                    output_tokens = SentinelAIAgent.estimate_tokens(content_str)
+                    total_tokens = input_tokens + output_tokens
+                    
+                    # Print Stats Panel
+                    stats_grid = Table.grid(expand=True, padding=(0,2))
+                    stats_grid.add_column(style="dim")
+                    stats_grid.add_column(style="bold white")
+                    
+                    stats_grid.add_row("Duration:", f"{duration:.2f}s")
+                    stats_grid.add_row("Input Tokens:", f"{input_tokens}")
+                    stats_grid.add_row("Output Tokens:", f"{output_tokens}")
+                    stats_grid.add_row("Total Tokens:", f"{total_tokens}")
+                    
+                    console.print(Panel(
+                        stats_grid, 
+                        title=f"[bold green]Tool Stats: {fname}[/bold green]",
+                        border_style="dim green",
+                        width=60
+                    ))
+                    
                     self.conversation_history.append({
                         "role": "tool",
-                        "content": str(result.content)
+                        "tool_call_id": tool_call.get("id"),
+                        "content": content_str # Use truncated version
                     })
-                    
             except Exception as e:
-                console.print(f"[bold red]API Error:[/bold red] {str(e)}")
-                if hasattr(e, 'response'):
-                    try:
-                        console.print(f"[dim]Response Body: {e.response.text}[/dim]")
-                    except:
-                        pass
+                if not self.using_fallback:
+                    console.print(f"[bold yellow]⚠ Primary Server Failed:[/bold yellow] {str(e)}")
+                    console.print(f"[dim]Attempting Fallback...[/dim]")
+                    self.using_fallback = True
+                    # Re-attempt loop iteration with fallback client
+                    continue
+                
+                console.print(f"[bold red]API Error (Fallback):[/bold red] {str(e)}")
                 return f"Error: {str(e)}"
         
         return "Max tool iterations reached."
@@ -214,8 +303,8 @@ async def main():
         MCPServer(
             name="sentinel-ai",
             type="local",
-            command=r"E:\CyberSentinal All\Sentinel-AI\mcp-server\venv\Scripts\python.exe",
-            args=["-m", "sentinel_mcp.server", "--config", r"E:\CyberSentinal All\Sentinel-AI\mcp-server\config.yaml"]
+            command=r"E:\CyberSentinal All\Sentinel-AI\mcp-server\run_mcp_server.bat",
+            args=[]
         ),
 
         # --- EXAMPLES: Uncomment to enable ---
@@ -255,20 +344,26 @@ async def main():
         #     type="local",
         #     command="npx",
         #     args=["-y", "@modelcontextprotocol/server-google-maps"],
-        #     env={"GOOGLE_MAPS_API_KEY": os.getenv("GOOGLE_MAPS_API_KEY")}
-        # ),
     ]
+
 
     # Connection Phase
     with console.status("[bold green]Initializing Secure Connection...[/bold green]", spinner="dots"):
-        # 1. Connect to Ollama
+        # 1. Connect to Ollama Primary
         try:
-            agent.client.list() # Test auth
-            console.print(f"[bold green]✓[/bold green] Authorized with Ollama Cloud ({agent.model})")
+            agent.primary_client.list() # Test connection
+            console.print(f"[bold green]✓[/bold green] Linked Primary: [cyan]{agent.primary_host}[/cyan] ({agent.primary_model})")
         except Exception as e:
-            console.print(f"[bold red]✗ Auth Failed![/bold red] {str(e)}")
-            console.print_exception()
-            return
+            console.print(f"[bold yellow]⚠ Primary Offline:[/bold yellow] {agent.primary_host}")
+            agent.using_fallback = True
+
+        if agent.using_fallback:
+            try:
+                agent.fallback_client.list() # Test auth
+                console.print(f"[bold cyan]ℹ Fallback Active:[/bold cyan] {agent.fallback_host} ({agent.fallback_model})")
+            except Exception as e:
+                console.print(f"[bold red]✗ Fallback Auth Failed![/bold red] {str(e)}")
+                return
 
         # 2. Connect to MCP
         for server in mcp_config:

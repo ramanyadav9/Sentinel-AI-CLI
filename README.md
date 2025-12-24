@@ -87,6 +87,12 @@ Search for places, get directions and elevation.
 - **Command**: `npx -y @modelcontextprotocol/server-google-maps`
 - **Env Vars**: `GOOGLE_MAPS_API_KEY`
 
+### 📹 LiveKit Docs
+Access LiveKit documentation directly.
+- **Type**: Remote (SSE)
+- **URL**: `https://docs.livekit.io/mcp`
+- **Env Vars**: None
+
 ### 🐘 PostgreSQL
 Read-only database access to inspect schemas and run queries.
 - **Command**: `npx -y @modelcontextprotocol/server-postgres <postgres-connection-string>`
